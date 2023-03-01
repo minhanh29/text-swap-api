@@ -1,7 +1,8 @@
 import os
+import json
+import base64
 from time import time
 import textwrap
-from textblob import TextBlob
 import math
 from skimage import io
 from scipy import stats
@@ -21,7 +22,6 @@ from googletrans import Translator
 import onnxruntime
 
 import io
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "./keys/text-replace-366410-b1df0306b203.json"
 from google.cloud import vision
 
 img_dir = "./inputs/assasin_title/"
@@ -30,9 +30,6 @@ pil_to_tensor = transforms.Compose([
     transforms.PILToTensor(),
     transforms.Grayscale(1)
 ])
-
-# for testing
-write_image = True
 
 
 def preprocess(batch):
@@ -83,8 +80,7 @@ def expand_bbox(bbox, img_shape, w_ratio=0.1, h_ratio=0.3):
 
 
 class ModelFactory:
-    def __init__(self, model_dir="./weights", font_dir="./fonts"):
-        self.font_dir = font_dir
+    def __init__(self, model_dir="./weights"):
         FONT_FILE = "./font_list.txt"
         with open(FONT_FILE, "r", encoding="utf-8") as f:
             font_list = f.readlines()
@@ -105,7 +101,7 @@ class ModelFactory:
         self.ocr_client = vision.ImageAnnotatorClient()
 
     def translate(self, text):
-        return self.translator.translate(text, src="en", dest="vi").text
+        return self.translator.translate(text.lower(), src="en", dest="vi").text
 
     def detect_text(self, img_path):
         # Loads the image into memory
@@ -116,40 +112,41 @@ class ModelFactory:
 
         response = self.ocr_client.text_detection(image=image)
         texts = response.text_annotations
-        print('Texts:')
 
         result = []
         for i, text in enumerate(texts):
-            print(text.description)
             if i == 0:
                 continue
 
             vertices = ([[vertex.x, vertex.y]
                         for vertex in text.bounding_poly.vertices])
 
-            print("bounds", vertices)
             boxes = np.array(vertices)
             result.append([boxes, text.description])
         return result
 
-    def extract_background(self, img_list, mask_list):
-        new_img_list = []
-        new_mask_list = []
-        for img, mask in zip(img_list, mask_list):
-            # img = cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
+    def extract_background(self, img, mask):
+        img_flat = np.reshape(cv2.cvtColor(img, cv2.COLOR_RGB2HSV), (-1, 3))
+        mask_flat = mask.flatten()
+        color_arr = img_flat[mask_flat < 120]
+        h_std = np.std(color_arr[:, 0])
+        s_std = np.std(color_arr[:, 1])
+        v_std = np.std(color_arr[:, 2])
+        max_std = max(h_std, s_std, v_std)
+        print("Image shape", img.shape)
+        print("Max std", h_std, s_std, v_std, max_std)
+        if max_std < 10:
+            print("Inpaint using OpenCV")
+            return cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
 
-            # Lama
-            print("Image shape", img.shape)
-            img = np.transpose(img, (2, 0, 1))
-            img = img.astype('float32') / 255
-            mask = mask.astype('float32') / 255
+        # Lama
+        print("Inpaint using Lama")
+        img = np.transpose(img, (2, 0, 1))
+        img = img.astype('float32') / 255
+        mask = mask.astype('float32') / 255
 
-            new_img_list.append(img)
-            new_mask_list.append(mask)
-
-        result = self.inpainter.predict(new_img_list, new_mask_list)
-        return result
-        # return new_img_list
+        result = self.inpainter.predict([img], [mask])
+        return result[0]
 
     def extract_mask(self, img):
         img = img/127.5 - 1
@@ -164,10 +161,9 @@ class ModelFactory:
         pred = self.font_clf.run(None, {self.font_clf.get_inputs()[0].name: img.cpu().numpy()})[0]
         pred[:, self.exclude_list] = 0
         chosen = np.argmax(pred, axis=-1)
-        font_path = []
         for idx in chosen:
-            font_path.append(os.path.join(self.font_dir, self.font_list[int(idx)]))
-        return font_path
+            font_path = self.font_list[int(idx)]
+            return int(idx), font_path
 
 class BBox:
     def __init__(self, x1, y1, x2, y2):
@@ -218,13 +214,16 @@ class Roi:
         self.bbox = bbox
         self.innerBbox = innerBbox
         self.img = self.bbox.crop(img)
+        self.font_id = 0
+        self.font_path = "Minh Anh"
+        self.fontsize = 30
 
         high_contrast_img = cv2.convertScaleAbs(self.img, alpha=1.5)
         high_contrast_img = torch.as_tensor(high_contrast_img)
         high_contrast_img = torch.permute(high_contrast_img, (2, 0, 1))
         self.high_contrast_img = high_contrast_img
 
-    def preprocess(self, detect_font=True):
+    def preprocess(self, detect_font=True, find_font_size=True):
         self.extract_mask()
         if detect_font:
             self.detect_font()
@@ -256,7 +255,7 @@ class Roi:
         return self.mask, self.bbox.get()
 
     def detect_font(self):
-        self.font_path = self.model_factory.detect_font(torch.unsqueeze(self.torch_mask, dim=0))[0]
+        self.font_id, self.font_path = self.model_factory.detect_font(torch.unsqueeze(self.torch_mask, dim=0))
         print(self.text, self.font_path)
 
     def __str__(self):
@@ -275,23 +274,37 @@ class Roi:
 
 
 class TextSwapper:
-    def __init__(self, model_factory, img, unified=False, translated_paragraph=None):
+    def __init__(self, model_factory, img, img_path, translate=True, unified=False, translated_paragraph=None, perspective_points=[]):
         '''
         model_factory: ModelFactory object
         img: cv2 image
         unified: treats all the lines as one unified paragraph
         '''
 
+        if len(perspective_points) == 8:
+            self.original_img = img.copy()
+            box = np.int0([[perspective_points[i], perspective_points[i+1]]
+                           for i in range(0, len(perspective_points)-1, 2)])
+            self.img, self.M_inverse = four_point_transform(img.copy(), box)
+            self.perspective = True
+        else:
+            self.original_img = None
+            self.img = img
+            self.perspective = False
+
+        # for google detector
+        cv2.imwrite(img_path, cv2.cvtColor(self.img, cv2.COLOR_RGB2BGR))
+        self.img_path = img_path
         self.model_factory = model_factory
-        self.img = img
         self.rois = []
         self.translated_paragraph = translated_paragraph
         self.num_sentences = 0
         self.max_line_length = 0
         self.unified = unified
+        self.translate = translate
 
-    def detect_text(self, img_path):
-        result = self.model_factory.detect_text(img_path)
+    def detect_text(self):
+        result = self.model_factory.detect_text(self.img_path)
         if len(result) == 0:
             return False, "No text found"
 
@@ -320,7 +333,10 @@ class TextSwapper:
         print("Original paragraph\n", paragraph)
         temp = cv2.cvtColor(temp, cv2.COLOR_RGB2BGR)
         if self.translated_paragraph is None:
-            self.translated_paragraph = self.model_factory.translate(paragraph)
+            if self.translate:
+                self.translated_paragraph = self.model_factory.translate(paragraph)
+            else: # keep the original paragraph
+                self.translated_paragraph = paragraph
         print("Translated\n", self.translated_paragraph)
 
         all_bboxes = np.concatenate(all_bboxes).astype("int32")
@@ -390,24 +406,31 @@ class TextSwapper:
 
         # preprocess and detect_font
         font_path = None
+        font_id = 0
+        color = np.int0([0, 0, 0])
         if self.unified:
-            text_h = 0
-            max_roi = max([(len(r.target_text), r) for r in self.rois], key=lambda x: x[0])[1]
-            max_roi.preprocess(detect_font=True)
+            max_roi = max([(r.bbox.height() * r.bbox.width(), r) for r in self.rois], key=lambda x: x[0])[1]
+            max_roi.preprocess(detect_font=True, find_font_size=True)
             font_path = max_roi.font_path
-            text_h = max_roi.text_h
+            font_id = max_roi.font_id
+            color = max_roi.color
 
             for roi in self.rois:
+                if roi.id == max_roi.id:
+                    continue
                 roi.font_path = font_path
-                roi.text_h = text_h
-                roi.preprocess(detect_font=False)
+                roi.font_id = font_id
+                roi.color = color
+                roi.preprocess(detect_font=False, find_font_size=False)
         else:
             for roi in self.rois:
                 if font_path is None:
                     roi.preprocess(detect_font=True)
                     font_path = roi.font_path
+                    font_id = roi.font_id
                     continue
                 roi.font_path = font_path
+                roi.font_id = font_id
                 roi.preprocess(detect_font=False)
 
     def check_unified(self):
@@ -447,12 +470,114 @@ class TextSwapper:
     def extract_background(self):
         print("Extracting background...")
         mask = self.create_mask()
-        res_img = self.model_factory.extract_background([self.img], [mask])
-        res_img = res_img[0]
+
+        res_img = self.model_factory.extract_background(self.img, mask)
         self.bg_img = res_img
+
+        if self.perspective:
+            result_img_inverse = cv2.warpPerspective(res_img, self.M_inverse,
+                                                     (self.original_img.shape[1], self.original_img.shape[0]))
+            mask = np.ones(res_img.shape).astype("uint8") * 255
+            mask_inverse = cv2.warpPerspective(mask, self.M_inverse,
+                                               (self.original_img.shape[1], self.original_img.shape[0]))
+
+            # pad the mask
+            margin = 10
+            padded_mask = np.zeros((mask_inverse.shape[0] + margin, mask_inverse.shape[1] + margin, mask_inverse.shape[2]), dtype="uint8")
+            half_margin = margin // 2
+            padded_mask[half_margin:-half_margin, half_margin:-half_margin] = mask_inverse
+            padded_mask = cv2.erode(padded_mask, np.ones((5, 5), dtype="uint8"), iterations=1)
+            mask_inverse = padded_mask[half_margin:-half_margin, half_margin:-half_margin]
+
+            mask_inverse = mask_inverse.astype("float32") / 255.
+            res_img = self.original_img * (1 - mask_inverse) + result_img_inverse * mask_inverse
+
         res_img = cv2.cvtColor(res_img, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(os.path.join(img_dir, "bg.png"), res_img)
+        retval, buffer = cv2.imencode('.png', res_img)
+        img_as_text = base64.b64encode(buffer)
         print("Done")
+
+        # return buffer.tobytes()
+        return img_as_text
+
+    def warp_bbox(self, bbox):
+        if not self.perspective:
+            return bbox
+
+        x1, y1, x2, y2 = bbox
+        pts = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        result = []
+        for pt in pts:
+            vec = np.float32([pt[0], pt[1], 1])
+            vec = np.reshape(vec, (3, 1))
+            newVec = self.M_inverse @ vec
+            result.append([int(newVec[0, 0] / newVec[2, 0]), int(newVec[1, 0]) / newVec[2, 0]])
+
+        result = np.array(result, dtype="int32")
+        x1 = np.min(result[:, 0])
+        x2 = np.max(result[:, 0])
+        y1 = np.min(result[:, 1])
+        y2 = np.max(result[:, 1])
+
+        result[:, 0] = result[:, 0] - bbox[0]
+        result[:, 1] = result[:, 1] - bbox[1]
+
+        return list(map(int, [x1, y1, x2, y2])), result.tolist()
+
+    def get_response(self):
+        if len(self.rois) == 0:
+            return []
+
+        result = []
+        if self.unified:
+            roi = self.rois[0]
+
+            target_text = " ".join([r.target_text.strip() for r in self.rois])
+            x1 = min([r.bbox.abs_inner(r.innerBbox).x1 for r in self.rois])
+            x2 = max([r.bbox.abs_inner(r.innerBbox).x2 for r in self.rois])
+            y1 = min([r.bbox.abs_inner(r.innerBbox).y1 for r in self.rois])
+            y2 = max([r.bbox.abs_inner(r.innerBbox).y2 for r in self.rois])
+            bbox = list(map(int, [x1, y1, x2, y2]))
+            perspectivePoints = []
+            oldBbox = bbox
+
+            if self.perspective:
+                bbox, perspectivePoints = self.warp_bbox(bbox)
+
+            data = {
+                "target_text": target_text,
+                "fontId": roi.font_id,
+                "fontName": roi.font_path.split("/")[-1].replace(".ttf", ""),
+                "color": [int(c) for c in roi.color],
+                "bbox": bbox,
+                "oldBbox": oldBbox,
+                "perspectivePoints": perspectivePoints,
+                "center": roi.center_align
+            }
+            result.append(data)
+        else:
+            for roi in self.rois:
+                bbox = [int(x) for x in roi.bbox.abs_inner(roi.innerBbox).get()]
+                perspectivePoints = []
+                oldBbox = bbox
+
+                if self.perspective:
+                    bbox, perspectivePoints = self.warp_bbox(bbox)
+
+                data = {
+                    "target_text": roi.target_text,
+                    "fontId": roi.font_id,
+                    "fontName": roi.font_path.split("/")[-1].replace(".ttf", ""),
+                    "color": [int(c) for c in roi.color],
+                    "bbox": bbox,
+                    "oldBbox": oldBbox,
+                    "perspectivePoints": perspectivePoints,
+                    "center": roi.center_align
+                }
+                result.append(data)
+        print("Result", result)
+        return result
+
 
 def order_points(pts):
 	rect = np.zeros((4, 2), dtype = "float32")
@@ -485,42 +610,16 @@ def four_point_transform(image, pts):
 	return warped, M_inverse
 
 
-def get_roi_from_img(original_img):
-    refPts = []
+def get_roi_from_img(original_img, refPts):
     img = original_img.copy()
-    warpedImg = img
-    M_inverse = None
-    def click_and_crop(event, x, y, flags, param):
-        nonlocal refPts, warpedImg, M_inverse
-        if event == cv2.EVENT_LBUTTONDOWN:
-            refPts.append((x, y))
-            cv2.circle(img, (x, y), 3, (255, 255, 0), -1)
-        elif event == cv2.EVENT_LBUTTONUP and len(refPts) == 4:
-            box = np.int0(refPts)
-            cv2.drawContours(img, [box], 0, (0,191,255), 2)
+    box = np.int0(refPts)
+    warpedImg, M_inverse = four_point_transform(original_img.copy(), box)
 
-            warpedImg, M_inverse = four_point_transform(original_img.copy(), box)
-            refPts = []
-            cv2.imshow("warped", warpedImg)
-
-
-    cv2.namedWindow("image")
-    cv2.setMouseCallback("image", click_and_crop)
-    # keep looping until the 'q' key is pressed
-    while True:
-        # display the image and wait for a keypress
-        cv2.imshow("image", img)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-
-    cv2.destroyAllWindows()
-
-    return warpedImg, M_inverse
+    return four_point_transform
 
 
 def static_main():
-    model_factory = ModelFactory("./weights", "./fonts")
+    model_factory = ModelFactory("./weights")
     img_path = os.path.join(img_dir, "original.png")
     img = cv2.imread(img_path)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -537,7 +636,7 @@ def static_main():
     text_swapper.extract_background()
 
 def roi_main():
-    model_factory = ModelFactory("./weights", "./fonts")
+    model_factory = ModelFactory("./weights")
     img_path = os.path.join(img_dir, "original.png")
     full_img = cv2.imread(img_path)
 

@@ -11,8 +11,7 @@ def extract_color(img, mask):
     img and mask must have the same shape, mask has 1 channel
     mask: 0 - 255
     '''
-    if mask.shape != img.shape:
-        mask = cv2.resize(mask, (img.shape[1], img.shape[0]))
+    mask = cv2.resize(mask, (img.shape[1], img.shape[0]))
     img = np.reshape(img, (-1, 3))
     mask = mask.flatten()
     color_arr = img[mask > 120]

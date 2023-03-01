@@ -1,0 +1,7 @@
+version: '3.7'
+services:
+  text-swap-api:
+    image: text-swap-api
+    build: .
+    ports:
+      - "8000:8000"
